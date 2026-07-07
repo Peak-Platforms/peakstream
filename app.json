@@ -1,5 +1,6 @@
 {
   "expo": {
+    "newArchEnabled": false,
     "name": "peakstream",
     "slug": "peakstream",
     "version": "1.0.0",
