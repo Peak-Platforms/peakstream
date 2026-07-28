@@ -1,12 +1,13 @@
-﻿/**
+/**
  * BroadcasterScreen.tsx  —  PeakStream  (WebRTC-only Encoder)
  *
  * WebRTC/WHIP publish only. RTMP support (native RootEncoder module,
  * server-IP field, protocol toggle, local recording) has been removed —
  * that capability now lives in StreamPal Broadcaster.
  *
- * Nothing below in the WebRTC code path has been changed from the
- * dual-protocol version — only RTMP-specific code was removed.
+ * VBR: WebRTC's encoder is variable-bitrate by default within the bounds
+ * set via sender.setParameters() — no separate mode flag needed (unlike
+ * RootEncoder/RTMP). Ceiling set to 25Mbps @ 60fps ("Pro" preset).
  */
 
 import React, {useCallback, useEffect, useRef, useState} from 'react';
@@ -29,6 +30,12 @@ import {RTCPeerConnection, RTCView, mediaDevices} from 'react-native-webrtc';
 const DEFAULT_STREAM_KEY = 'fancast-1';
 const WEBRTC_HOST = 'peak.streampal.fun:8444'; // TLS cert — do not change
 const STORAGE_KEY = 'peakstream_config';
+
+// ── VIDEO QUALITY (Pro preset: 1080p60, VBR ceiling 25Mbps) ────────────────
+const WEBRTC_WIDTH = 1920;
+const WEBRTC_HEIGHT = 1080;
+const WEBRTC_FPS = 60;
+const MAX_BITRATE_WEBRTC = 25_000_000;
 
 // ── BRAND COLORS ─────────────────────────────────────────────────────────
 const RED = '#dc2626';
@@ -58,21 +65,32 @@ export default function BroadcasterScreen() {
   const [permissionsGranted, setPermissionsGranted] = useState(false);
   const [localStream, setLocalStream] = useState<any>(null);
   const [facing, setFacing] = useState<'environment' | 'user'>('environment');
+  const [bitrateKbps, setBitrateKbps] = useState(0);
+  const [fps, setFps] = useState(0);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<any>(null);
   const whipResourceUrlRef = useRef<string | null>(null);
+  const statsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastBytesSentRef = useRef(0);
+  const lastStatsTimeRef = useRef(0);
 
   // Start/stop the WebRTC camera preview — always mounted (once permissions
   // are granted) so the operator can frame the shot before going live.
-  // UNCHANGED from the dual-protocol version.
+  // Requests the Pro preset (1080p60); device picks closest supported mode
+  // if exact values aren't available (no OverconstrainedError crash).
   useEffect(() => {
     let cancelled = false;
     if (permissionsGranted && !showSettings) {
       mediaDevices
         .getUserMedia({
           audio: true,
-          video: {width: 1280, height: 720, frameRate: 30, facingMode: facing},
+          video: {
+            width: {ideal: WEBRTC_WIDTH},
+            height: {ideal: WEBRTC_HEIGHT},
+            frameRate: {ideal: WEBRTC_FPS},
+            facingMode: facing,
+          },
         })
         .then((stream: any) => {
           if (cancelled) {
@@ -139,7 +157,39 @@ export default function BroadcasterScreen() {
     setStatus('Settings saved');
   }, []);
 
-  // ── WebRTC/WHIP path — UNCHANGED from the dual-protocol version ──────────
+  // ── BITRATE/FPS MONITOR — polls getStats(), drives the on-screen counter ──
+  const startBitrateMonitor = useCallback((pc: RTCPeerConnection) => {
+    lastBytesSentRef.current = 0;
+    lastStatsTimeRef.current = Date.now();
+    statsIntervalRef.current = setInterval(async () => {
+      try {
+        const stats = await pc.getStats();
+        stats.forEach((report: any) => {
+          if (report.type === 'outbound-rtp' && report.kind === 'video') {
+            const now = Date.now();
+            const dt = (now - lastStatsTimeRef.current) / 1000;
+            const dBytes = report.bytesSent - lastBytesSentRef.current;
+            const kbps = dt > 0 ? Math.round((dBytes * 8) / dt / 1000) : 0;
+            lastBytesSentRef.current = report.bytesSent;
+            lastStatsTimeRef.current = now;
+            setBitrateKbps(kbps);
+            if (report.framesPerSecond) setFps(Math.round(report.framesPerSecond));
+          }
+        });
+      } catch {}
+    }, 2000);
+  }, []);
+
+  const stopBitrateMonitor = useCallback(() => {
+    if (statsIntervalRef.current) {
+      clearInterval(statsIntervalRef.current);
+      statsIntervalRef.current = null;
+    }
+    setBitrateKbps(0);
+    setFps(0);
+  }, []);
+
+  // ── WebRTC/WHIP path ────────────────────────────────────────────────────
   const goLiveWebrtc = useCallback(async () => {
     const stream = localStreamRef.current;
     if (!stream) throw new Error('Camera preview not ready yet');
@@ -153,10 +203,9 @@ export default function BroadcasterScreen() {
       if (track.kind === 'video') videoSender = sender;
     });
 
-    // VBR: WebRTC's encoder is variable-bitrate by default within these bounds —
-    // no separate mode flag needed (unlike RootEncoder/RTMP's MAX_BITRATE path).
-    // Wrapped defensively: some react-native-webrtc versions/devices don't
-    // support setParameters on encodings — that must not crash the stream.
+    // VBR ceiling: 25Mbps @ 60fps. Wrapped defensively — some
+    // react-native-webrtc versions/devices don't support setParameters
+    // on encodings, and that must not crash the stream.
     if (videoSender) {
       try {
         const params = videoSender.getParameters();
@@ -190,14 +239,14 @@ export default function BroadcasterScreen() {
     const answerSdp = await res.text();
     await pc.setRemoteDescription({type: 'answer', sdp: answerSdp});
 
-    const videoTrack = stream.getVideoTracks()[0];
-    if (videoTrack) startBitrateMonitor(pc, videoTrack.id);
+    startBitrateMonitor(pc);
   }, [cfg, startBitrateMonitor]);
 
   const stopLiveWebrtc = useCallback(async () => {
     // Only close the publish connection — leave the local preview
     // (camera + mic tracks) running so the operator can frame the
     // next shot without waiting for permissions/camera to reinit.
+    stopBitrateMonitor();
     pcRef.current?.close();
     pcRef.current = null;
 
@@ -205,14 +254,14 @@ export default function BroadcasterScreen() {
       fetch(whipResourceUrlRef.current, {method: 'DELETE'}).catch(() => {});
       whipResourceUrlRef.current = null;
     }
-  }, []);
+  }, [stopBitrateMonitor]);
 
   const goLive = useCallback(async () => {
     try {
       setBusy(true);
       await goLiveWebrtc();
       setLive(true);
-      setStatus('Live - WEBRTC');
+      setStatus('Live · WEBRTC');
     } catch (err: any) {
       setStatus(`Start failed: ${err?.message ?? err}`);
     } finally {
@@ -247,17 +296,23 @@ export default function BroadcasterScreen() {
       )}
       {!localStream && (
         <View style={[styles.fullScreenPreview, styles.previewPlaceholder]}>
-          <Text style={{color: '#555', fontSize: 12}}>Starting camera preview...</Text>
+          <Text style={{color: '#555', fontSize: 12}}>Starting camera preview…</Text>
         </View>
-      )}
-      {cfg.protocol === 'webrtc' && webrtcStreamUrl && (
-        <RTCView streamURL={webrtcStreamUrl} style={styles.cameraPreview} objectFit="cover" />
       )}
 
       {!!localStream && (
         <Pressable style={styles.flipBtn} onPress={flipCamera}>
           <Text style={styles.flipBtnText}>Flip</Text>
         </Pressable>
+      )}
+
+      {live && (
+        <View style={styles.bitrateBadge}>
+          <Text style={styles.bitrateBadgeText}>
+            {bitrateKbps >= 1000 ? `${(bitrateKbps / 1000).toFixed(1)} Mbps` : `${bitrateKbps} Kbps`}
+            {fps ? ` · ${fps}fps` : ''}
+          </Text>
+        </View>
       )}
 
       <View style={styles.overlayTop}>
@@ -274,14 +329,14 @@ export default function BroadcasterScreen() {
         </View>
 
         <Text style={styles.keyLabel}>
-          {cfg.streamKey || DEFAULT_STREAM_KEY} - WEBRTC
+          {cfg.streamKey || DEFAULT_STREAM_KEY} · WEBRTC · VBR ≤25Mbps 1080p60
         </Text>
       </View>
 
       <View style={styles.overlayBottom}>
         {!live ? (
           <Pressable style={styles.btn} onPress={goLive} disabled={busy}>
-            <Text style={styles.btnText}>{busy ? 'Starting...' : 'GO LIVE'}</Text>
+            <Text style={styles.btnText}>{busy ? 'Starting…' : 'GO LIVE'}</Text>
           </Pressable>
         ) : (
           <Pressable style={[styles.btn, styles.btnStop]} onPress={stopLive}>
@@ -327,13 +382,15 @@ function SettingsScreen({cfg, onSave}: {cfg: Config; onSave: (c: Config) => void
           placeholder="e.g. camera1"
           placeholderTextColor="#555" autoCapitalize="none" autoCorrect={false} />
 
-        <Text style={settings.urlPreview}>-&gt; {buildStreamUrl(local)}</Text>
+        <Text style={settings.hint}>VBR active — 1080p60, ceiling 25Mbps, adjusts to network conditions.</Text>
+
+        <Text style={settings.urlPreview}>→ {buildStreamUrl(local)}</Text>
 
         <Pressable style={settings.saveBtn} onPress={() => onSave(local)}>
           <Text style={settings.saveBtnText}>SAVE & CONTINUE</Text>
         </Pressable>
 
-        <Text style={settings.footer}>Peak Platforms - XSEN - PeakStream</Text>
+        <Text style={settings.footer}>Peak Platforms · XSEN · PeakStream</Text>
       </ScrollView>
     </KeyboardAvoidingView>
   );
@@ -345,6 +402,8 @@ const styles = StyleSheet.create({
   previewPlaceholder: {alignItems:'center', justifyContent:'center'},
   flipBtn: {position:'absolute', top:56, right:20, backgroundColor:'rgba(0,0,0,0.6)', paddingVertical:6, paddingHorizontal:14, borderRadius:16, borderWidth:1, borderColor:RED, zIndex:2},
   flipBtnText: {color:'#fff', fontSize:12, fontWeight:'600'},
+  bitrateBadge: {position:'absolute', top:56, left:20, backgroundColor:'rgba(0,0,0,0.6)', paddingVertical:6, paddingHorizontal:14, borderRadius:16, zIndex:2},
+  bitrateBadgeText: {color:'#f1f5f9', fontSize:12, fontFamily:'monospace', fontWeight:'600'},
   overlayTop: {position:'absolute', top:0, left:0, right:0, alignItems:'center', paddingTop:48, paddingBottom:20, paddingHorizontal:20, gap:8, backgroundColor:'rgba(10,10,10,0.55)'},
   overlayBottom: {position:'absolute', bottom:0, left:0, right:0, alignItems:'center', paddingTop:20, paddingBottom:36, paddingHorizontal:20, gap:8, backgroundColor:'rgba(10,10,10,0.55)'},
   header: {flexDirection:'row', alignItems:'baseline'},
@@ -370,6 +429,7 @@ const settings = StyleSheet.create({
   titleStream: {fontSize:28, fontWeight:'900', color:'#ffffff'},
   subtitle: {fontSize:10, color:'#555', letterSpacing:2, textTransform:'uppercase', textAlign:'center', marginBottom:20},
   section: {fontSize:11, fontWeight:'700', color:RED, letterSpacing:1.5, textTransform:'uppercase', marginTop:16, marginBottom:4},
+  hint: {fontSize:11, color:'#444', lineHeight:16, marginTop:8},
   label: {fontSize:10, fontWeight:'600', color:'#555', letterSpacing:1, textTransform:'uppercase', marginTop:12, marginBottom:4},
   input: {backgroundColor:BG2, borderWidth:1, borderColor:'rgba(220,38,38,0.2)', borderRadius:8, padding:14, fontSize:15, color:'#f1f5f9'},
   readOnly: {backgroundColor:BG2, borderWidth:1, borderColor:'rgba(220,38,38,0.2)', borderRadius:8, padding:14},
