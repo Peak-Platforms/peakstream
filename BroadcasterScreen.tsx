@@ -146,7 +146,29 @@ export default function BroadcasterScreen() {
 
     const pc = new RTCPeerConnection({iceServers: []});
     pcRef.current = pc;
-    stream.getTracks().forEach((track: any) => pc.addTrack(track, stream));
+
+    let videoSender: any = null;
+    stream.getTracks().forEach((track: any) => {
+      const sender = pc.addTrack(track, stream);
+      if (track.kind === 'video') videoSender = sender;
+    });
+
+    // VBR: WebRTC's encoder is variable-bitrate by default within these bounds —
+    // no separate mode flag needed (unlike RootEncoder/RTMP's MAX_BITRATE path).
+    // Wrapped defensively: some react-native-webrtc versions/devices don't
+    // support setParameters on encodings — that must not crash the stream.
+    if (videoSender) {
+      try {
+        const params = videoSender.getParameters();
+        if (!params.encodings) params.encodings = [{}];
+        params.encodings[0].maxBitrate = MAX_BITRATE_WEBRTC;
+        params.encodings[0].maxFramerate = WEBRTC_FPS;
+        params.degradationPreference = 'maintain-framerate';
+        await videoSender.setParameters(params);
+      } catch (e) {
+        // Non-fatal — stream continues at whatever bitrate/fps the device defaults to.
+      }
+    }
 
     const offer = await pc.createOffer({});
     await pc.setLocalDescription(offer);
@@ -167,7 +189,10 @@ export default function BroadcasterScreen() {
     }
     const answerSdp = await res.text();
     await pc.setRemoteDescription({type: 'answer', sdp: answerSdp});
-  }, [cfg]);
+
+    const videoTrack = stream.getVideoTracks()[0];
+    if (videoTrack) startBitrateMonitor(pc, videoTrack.id);
+  }, [cfg, startBitrateMonitor]);
 
   const stopLiveWebrtc = useCallback(async () => {
     // Only close the publish connection — leave the local preview
@@ -224,6 +249,9 @@ export default function BroadcasterScreen() {
         <View style={[styles.fullScreenPreview, styles.previewPlaceholder]}>
           <Text style={{color: '#555', fontSize: 12}}>Starting camera preview...</Text>
         </View>
+      )}
+      {cfg.protocol === 'webrtc' && webrtcStreamUrl && (
+        <RTCView streamURL={webrtcStreamUrl} style={styles.cameraPreview} objectFit="cover" />
       )}
 
       {!!localStream && (
