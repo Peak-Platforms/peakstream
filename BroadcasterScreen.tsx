@@ -23,7 +23,7 @@ import {
   requireNativeComponent,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {RTCPeerConnection, mediaDevices} from 'react-native-webrtc';
+import {RTCPeerConnection, RTCView, mediaDevices} from 'react-native-webrtc';
 
 const {RtmpPublisher} = NativeModules;
 const RtmpCameraPreview = requireNativeComponent('RtmpCameraPreview');
@@ -78,6 +78,7 @@ export default function BroadcasterScreen() {
   const [recordLocally, setRecordLocally] = useState(false);
   const [webrtcBitrateKbps, setWebrtcBitrateKbps] = useState(0);
   const [webrtcFps, setWebrtcFps] = useState(0);
+  const [webrtcStreamUrl, setWebrtcStreamUrl] = useState<string | null>(null);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<any>(null);
@@ -151,11 +152,27 @@ export default function BroadcasterScreen() {
   }, []);
 
   const goLiveWebrtc = useCallback(async () => {
-    const stream = await mediaDevices.getUserMedia({
-      audio: true,
-      video: {width: WEBRTC_WIDTH, height: WEBRTC_HEIGHT, frameRate: WEBRTC_FPS},
-    });
+    let stream;
+    try {
+      // 'ideal' lets the device pick its closest supported mode instead of
+      // throwing OverconstrainedError if exact 1080p60 isn't available.
+      stream = await mediaDevices.getUserMedia({
+        audio: true,
+        video: {
+          width: {ideal: WEBRTC_WIDTH},
+          height: {ideal: WEBRTC_HEIGHT},
+          frameRate: {ideal: WEBRTC_FPS},
+        },
+      });
+    } catch (e) {
+      // Hard fallback to a conservative mode if the device rejects the above.
+      stream = await mediaDevices.getUserMedia({
+        audio: true,
+        video: {width: 1280, height: 720, frameRate: 30},
+      });
+    }
     localStreamRef.current = stream;
+    setWebrtcStreamUrl(stream.toURL());
 
     const pc = new RTCPeerConnection({iceServers: []});
     pcRef.current = pc;
@@ -168,13 +185,19 @@ export default function BroadcasterScreen() {
 
     // VBR: WebRTC's encoder is variable-bitrate by default within these bounds —
     // no separate mode flag needed (unlike RootEncoder/RTMP's MAX_BITRATE path).
+    // Wrapped defensively: some react-native-webrtc versions/devices don't
+    // support setParameters on encodings — that must not crash the stream.
     if (videoSender) {
-      const params = videoSender.getParameters();
-      if (!params.encodings) params.encodings = [{}];
-      params.encodings[0].maxBitrate = MAX_BITRATE_WEBRTC;
-      params.encodings[0].maxFramerate = WEBRTC_FPS;
-      params.degradationPreference = 'maintain-framerate';
-      await videoSender.setParameters(params);
+      try {
+        const params = videoSender.getParameters();
+        if (!params.encodings) params.encodings = [{}];
+        params.encodings[0].maxBitrate = MAX_BITRATE_WEBRTC;
+        params.encodings[0].maxFramerate = WEBRTC_FPS;
+        params.degradationPreference = 'maintain-framerate';
+        await videoSender.setParameters(params);
+      } catch (e) {
+        // Non-fatal — stream continues at whatever bitrate/fps the device defaults to.
+      }
     }
 
     const offer = await pc.createOffer({});
@@ -194,6 +217,7 @@ export default function BroadcasterScreen() {
 
   const stopLiveWebrtc = useCallback(async () => {
     stopBitrateMonitor();
+    setWebrtcStreamUrl(null);
     pcRef.current?.close();
     pcRef.current = null;
     localStreamRef.current?.getTracks().forEach((t: any) => t.stop());
@@ -231,6 +255,9 @@ export default function BroadcasterScreen() {
     <View style={styles.container}>
       {cfg.protocol === 'rtmp' && (
         <RtmpCameraPreview style={styles.cameraPreview} />
+      )}
+      {cfg.protocol === 'webrtc' && webrtcStreamUrl && (
+        <RTCView streamURL={webrtcStreamUrl} style={styles.cameraPreview} objectFit="cover" />
       )}
 
       <View style={styles.header}>
@@ -423,3 +450,4 @@ const settings = StyleSheet.create({
   saveBtnText: {color:'#fff', fontSize:16, fontWeight:'800', letterSpacing:1},
   footer: {fontSize:10, color:'#222', textAlign:'center', letterSpacing:1, textTransform:'uppercase', marginTop:24},
 });
+
